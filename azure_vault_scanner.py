@@ -549,21 +549,294 @@ class AzureVaultScanner:
         print("\n" + "=" * 70 + "\n")
 
 
+class OfflineVaultAuditor:
+    """Static audit of realistic Azure Key Vault fixtures (no Azure access).
+
+    Reuses the same detection semantics as the live auditors (soft delete,
+    purge protection, network ACLs, access-policy permissions, certificate
+    expiry, secret staleness/purgeability, weak keys) but reads vault state
+    from a JSON fixture instead of the Azure management/data APIs.
+    """
+
+    def audit(self, vaults) -> List[Finding]:
+        findings: List[Finding] = []
+        for vault in vaults:
+            name = vault.get("name", "unknown")
+            props = vault.get("properties", {})
+            findings.extend(self._audit_vault_props(name, props))
+            findings.extend(AccessPolicyAuditor().audit({"properties": props}, name))
+            findings.extend(self._audit_certificates(name, props.get("certificates", [])))
+            findings.extend(self._audit_secrets(name, props.get("secrets", [])))
+            findings.extend(self._audit_keys(name, props.get("keys", [])))
+        return findings
+
+    def _audit_vault_props(self, name, props):
+        findings = []
+        enable_soft_delete = props.get("enableSoftDelete", False)
+        enable_purge_protection = props.get("enablePurgeProtection", False)
+        sku = props.get("sku", {}).get("name", "")
+        network_acls = props.get("networkAcls", {})
+
+        if not enable_soft_delete:
+            findings.append(Finding("HIGH", "Soft Delete Disabled",
+                                    f"KeyVault/{name}",
+                                    "Soft delete is disabled — secrets can be permanently deleted"))
+        if not enable_purge_protection:
+            findings.append(Finding("HIGH", "No Purge Protection",
+                                    f"KeyVault/{name}",
+                                    "Purge protection is disabled — vault can be purged after soft delete"))
+        if sku and sku.lower() == "standard":
+            findings.append(Finding("MEDIUM", "Standard SKU",
+                                    f"KeyVault/{name}",
+                                    "Using Standard SKU — Premium SKU required for HSM-backed keys"))
+        default_action = network_acls.get("defaultAction", "Allow")
+        if default_action == "Allow" and not network_acls.get("virtualNetworkRules"):
+            findings.append(Finding("HIGH", "No Network Restrictions",
+                                    f"KeyVault/{name}",
+                                    "Network ACL default action is Allow with no virtual network rules"))
+        bypass = network_acls.get("bypass", "None")
+        if bypass in ("AzureServices", "All"):
+            findings.append(Finding("MEDIUM", "Azure Services Bypass",
+                                    f"KeyVault/{name}",
+                                    f"Network ACL allows Azure services to bypass: {bypass}"))
+        return findings
+
+    def _audit_certificates(self, name, certs):
+        findings = []
+        for cert in certs or []:
+            cert_name = cert.get("name", "unknown")
+            attrs = cert.get("attributes", {})
+            enabled = attrs.get("enabled", True)
+            if not enabled:
+                findings.append(Finding("LOW", "Disabled Certificate",
+                                        f"KeyVault/{name}/cert/{cert_name}",
+                                        "Certificate is disabled"))
+            expires = attrs.get("expires", "")
+            if expires:
+                days_left = _days_until(expires)
+                if days_left is not None:
+                    if days_left < 0:
+                        findings.append(Finding("HIGH", "Expired Certificate",
+                                                f"KeyVault/{name}/cert/{cert_name}",
+                                                f"Certificate expired {abs(days_left)} days ago"))
+                    elif days_left < 30:
+                        findings.append(Finding("MEDIUM", "Expiring Certificate",
+                                                f"KeyVault/{name}/cert/{cert_name}",
+                                                f"Certificate expires in {days_left} days"))
+            recovery = attrs.get("recoveryLevel", "")
+            if recovery in ("Purgeable", ""):
+                findings.append(Finding("MEDIUM", "No Recovery Level",
+                                        f"KeyVault/{name}/cert/{cert_name}",
+                                        "Certificate has no recovery level set"))
+        return findings
+
+    def _audit_secrets(self, name, secrets):
+        findings = []
+        for secret in secrets or []:
+            secret_name = secret.get("name", "unknown")
+            attrs = secret.get("attributes", {})
+            enabled = attrs.get("enabled", True)
+            if not enabled:
+                findings.append(Finding("LOW", "Disabled Secret",
+                                        f"KeyVault/{name}/secret/{secret_name}",
+                                        "Secret is disabled but still exists"))
+            expires = attrs.get("expires", "")
+            if expires:
+                days_left = _days_until(expires)
+                if days_left is not None:
+                    if days_left < 0:
+                        findings.append(Finding("HIGH", "Expired Secret",
+                                                f"KeyVault/{name}/secret/{secret_name}",
+                                                f"Secret expired {abs(days_left)} days ago"))
+                    elif days_left < 7:
+                        findings.append(Finding("MEDIUM", "Expiring Secret",
+                                                f"KeyVault/{name}/secret/{secret_name}",
+                                                f"Secret expires in {days_left} days"))
+            recovery = attrs.get("recoveryLevel", "")
+            if recovery in ("Purgeable", ""):
+                findings.append(Finding("MEDIUM", "Purgeable Secret",
+                                        f"KeyVault/{name}/secret/{secret_name}",
+                                        "Secret is purgeable (no recovery protection)"))
+        return findings
+
+    def _audit_keys(self, name, keys):
+        findings = []
+        for key in keys or []:
+            key_name = key.get("name", "unknown")
+            kty = key.get("kty", "unknown")
+            if kty in ("RSA", "RSA-HSM"):
+                size = key.get("keySize", 0)
+                if 0 < size < 2048:
+                    findings.append(Finding("HIGH", "Weak Key Size",
+                                            f"KeyVault/{name}/key/{key_name}",
+                                            f"RSA key size is {size} bits (minimum 2048 recommended)"))
+            elif kty == "EC":
+                curve = key.get("crv", "")
+                if curve == "P-256K":
+                    findings.append(Finding("MEDIUM", "Legacy Curve",
+                                            f"KeyVault/{name}/key/{key_name}",
+                                            f"Using curve {curve} — consider P-256 or P-384"))
+            enabled = key.get("attributes", {}).get("enabled", True)
+            if not enabled:
+                findings.append(Finding("LOW", "Disabled Key",
+                                        f"KeyVault/{name}/key/{key_name}",
+                                        "Key is disabled"))
+        return findings
+
+
+def _days_until(iso) -> Optional[int]:
+    try:
+        exp_dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return (exp_dt - datetime.now(timezone.utc)).days
+    except (ValueError, TypeError):
+        return None
+
+
+def load_vault_fixtures(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except OSError as exc:
+        raise FileNotFoundError(f"Fixtures file not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in fixtures file {path}: {exc}") from exc
+    if isinstance(data, dict):
+        val = data.get("vaults", data.get("resources", []))
+        return val
+    if isinstance(data, list):
+        return data
+    raise ValueError(f"Unsupported fixture structure in {path}")
+
+
+def findings_to_json_offline(vaults, findings):
+    severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+    counts = {}
+    for f in findings:
+        counts[f.severity] = counts.get(f.severity, 0) + 1
+    crit_high = counts.get("CRITICAL", 0) + counts.get("HIGH", 0)
+    return {
+        "tool": "CL6-AzureKeyVaultOfflineAuditor",
+        "mode": "offline-fixture",
+        "vault_count": len(vaults),
+        "finding_count": len(findings),
+        "critical_high_count": crit_high,
+        "summary": counts,
+        "vaults": [v.get("name") for v in vaults],
+        "findings": [
+            {
+                "severity": f.severity,
+                "category": f.category,
+                "resource": f.resource,
+                "message": f.message,
+                "remediation": _azure_remediation(f.category),
+            }
+            for f in sorted(findings, key=lambda x: severity_order.get(x.severity, 5))
+        ],
+    }
+
+
+def _azure_remediation(category):
+    table = {
+        "Soft Delete Disabled": "Enable soft delete on the vault to protect against accidental deletion.",
+        "No Purge Protection": "Enable purge protection to prevent permanent destruction after soft delete.",
+        "Standard SKU": "Upgrade to Premium SKU if HSM-backed key requirements are needed.",
+        "No Network Restrictions": "Set network ACL defaultAction to Deny and allow only required virtual networks/IPs.",
+        "Azure Services Bypass": "Remove AzureServices/All bypass unless explicitly required.",
+        "Expired Certificate": "Renew or remove the certificate; track expiry in your change process.",
+        "Expiring Certificate": "Schedule renewal before the certificate expires.",
+        "No Recovery Level": "Enable recover/purge protection on the certificate.",
+        "Disabled Certificate": "Remove the disabled certificate from the vault.",
+        "Expired Secret": "Rotate the secret and purge its old versions.",
+        "Expiring Secret": "Rotate the secret before its scheduled expiry.",
+        "Purgeable Secret": "Enable soft delete / purge protection on the vault.",
+        "Disabled Secret": "Remove the disabled secret from the vault.",
+        "Weak Key Size": "Regenerate the RSA key with at least 2048 bits.",
+        "Legacy Curve": "Use P-256 or P-384 curves instead of P-256K.",
+        "Disabled Key": "Remove the disabled key from the vault.",
+        "No Access Policies": "Confirm vault uses RBAC; otherwise define least-privilege access policies.",
+        "Vault Enumeration": "No action — informational.",
+        "No Vaults Found": "No action — informational.",
+    }
+    return table.get(category, "Review and harden the affected Key Vault configuration.")
+
+
+def print_offline_report(vaults, findings):
+    print("\n" + "=" * 64)
+    print("  CL6 — Azure Key Vault Offline Audit")
+    print("=" * 64)
+    print(f"  Vaults audited: {len(vaults)}")
+    print(f"  Findings:       {len(findings)}")
+    print("=" * 64)
+    counts = {}
+    for f in findings:
+        counts[f.severity] = counts.get(f.severity, 0) + 1
+    for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+        if sev in counts:
+            print(f"    {sev:9s}: {counts[sev]}")
+    print()
+    for f in findings:
+        print(f"  [{f.severity:8s}] {f.category} | {f.resource}")
+        print(f"      {f.message}")
+        print(f"      Fix: {_azure_remediation(f.category)}")
+    print("\n" + "=" * 64 + "\n")
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="CL6 — Azure Key Vault Scanner")
-    parser.add_argument("--subscription-id", required=True, help="Azure subscription ID")
-    parser.add_argument("--token", required=True, help="Azure Bearer token")
+    parser.add_argument("--subscription-id", help="Azure subscription ID (live mode, your own at runtime only)")
+    parser.add_argument("--token", help="Azure Bearer token (live mode)")
+    parser.add_argument("--demo", action="store_true",
+                        help="Run offline demo against bundled fixture (no Azure access)")
+    parser.add_argument("--fixtures", default="",
+                        help="Path to Key Vault state fixtures JSON (offline audit)")
+    parser.add_argument("--output", "-o", default="", help="JSON output file")
+    parser.add_argument("--exit-code-on-findings", action="store_true",
+                        help="Exit 2 when CRITICAL/HIGH findings exist (CI-friendly)")
     args = parser.parse_args()
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    if args.demo or args.fixtures or not (args.subscription_id and args.token):
+        fixture = args.fixtures or os.path.join(base_dir, "fixtures", "vaults.json")
+        if not os.path.isfile(fixture):
+            print(f"[!] Fixture not found: {fixture}. Run --demo from the repo root.", file=sys.stderr)
+            return 1
+        print(f"[*] Offline mode — auditing fixtures: {fixture}")
+        try:
+            vaults = load_vault_fixtures(fixture)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        findings = OfflineVaultAuditor().audit(vaults)
+        print_offline_report(vaults, findings)
+        report = findings_to_json_offline(vaults, findings)
+        output = args.output or os.path.join(base_dir, "reports", "cl6-report.json")
+        write_report(report, output)
+        if args.exit_code_on_findings and report["critical_high_count"] > 0:
+            return 2
+        return 0
 
     scanner = AzureVaultScanner(args.subscription_id, args.token)
     vaults, findings = scanner.scan()
     scanner.print_report(vaults, findings)
-
+    if args.output:
+        report = findings_to_json_offline(vaults, findings)
+        write_report(report, args.output)
     critical = sum(1 for f in findings if f.severity == "CRITICAL")
-    if critical > 0:
-        sys.exit(2)
+    if args.exit_code_on_findings and (critical > 0 or
+                                       any(f.severity == "HIGH" for f in findings)):
+        return 2
+    return 0
+
+
+def write_report(report, output_path):
+    parent = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(parent, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2, sort_keys=True)
+    print(f"[+] JSON report written to {output_path}")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

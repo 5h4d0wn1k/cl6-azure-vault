@@ -1,0 +1,91 @@
+{
+  "subscription_id": "19200000-0000-0000-0000-000000000001",
+  "resource_group": "lab-rg",
+  "vaults": [
+    {
+      "name": "lab-prod-kv",
+      "properties": {
+        "tenantId": "00000000-0000-0000-0000-000000000000",
+        "vaultUri": "https://lab-prod-kv.vault.azure.net/",
+        "sku": {"name": "Standard"},
+        "enableSoftDelete": false,
+        "enablePurgeProtection": false,
+        "networkAcls": {
+          "defaultAction": "Allow",
+          "bypass": "AzureServices",
+          "ipRules": [],
+          "virtualNetworkRules": []
+        },
+        "accessPolicies": [
+          {
+            "tenantId": "00000000-0000-0000-0000-000000000000",
+            "objectId": "aaaa1111-bbbb-2222-cccc-3333dddd4444",
+            "displayName": "deploy-bot",
+            "permissionsToSecrets": [
+              {"permissions": ["get", "list", "set", "delete", "purge"]}
+            ],
+            "permissionsToKeys": [
+              {"permissions": ["all"]}
+            ]
+          },
+          {
+            "tenantId": "00000000-0000-0000-0000-000000000000",
+            "objectId": "bbbb2222-cccc-3333-dddd-4444eeee5555",
+            "displayName": "readonly-app",
+            "permissionsToSecrets": [
+              {"permissions": ["get", "list"]}
+            ]
+          }
+        ],
+        "secrets": [
+          {
+            "name": "db-password",
+            "attributes": {
+              "enabled": true,
+              "expires": "2025-01-01T00:00:00Z",
+              "recoveryLevel": "Purgeable"
+            }
+          },
+          {
+            "name": "api-key",
+            "attributes": {
+              "enabled": false,
+              "recoveryLevel": "Recoverable"
+            }
+          }
+        ],
+        "certificates": [
+          {
+            "name": "tls-ingress",
+            "attributes": {
+              "enabled": true,
+              "expires": "2026-01-01T00:00:00Z",
+              "recoveryLevel": "Purgeable"
+            }
+          },
+          {
+            "name": "tls-old",
+            "attributes": {
+              "enabled": true,
+              "expires": "2024-06-15T00:00:00Z"
+            }
+          }
+        ],
+        "keys": [
+          {
+            "name": "signing-key",
+            "kty": "RSA",
+            "keySize": 1024,
+            "attributes": {"enabled": true, "expires": "2027-01-01T00:00:00Z"}
+          },
+          {
+            "name": "ec-key",
+            "kty": "EC",
+            "crv": "P-256K",
+            "attributes": {"enabled": true}
+          }
+        ]
+      }
+    }
+  ]
+}
